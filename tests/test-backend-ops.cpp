@@ -12159,6 +12159,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
+    // Hexagon HVX packed weight tiles: odd and even K-tile counts, a partial last tile row, fewer tile rows than threads
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0}) {
+        for (int64_t k : {64, 224, 1440}) {
+            for (int64_t m : {64, 100}) {
+                for (int n : {1, 2, 3, 4}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, 1, 96,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 100, 3, 224, {2, 1}, {1, 1}));
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, b, 100, 1, 224));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 8, b, 64,  1, 96));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, b, 64,  2, 1440));
+        }
+    }
     // CUDA few-row MMQ: 1-3 column groups, 32-row tiles (6170 rows), K = 18 units (uneven over the warps) and 9 units (one unit per ring stage)
     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
@@ -13525,6 +13542,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q8_0, glu_op, 1, 32, k,
                 false, 16, 8, false, false, true, false, {1, 1}));
+        }
+    }
+
+    // Hexagon HVX packed weight tiles through the fused gate/up (MUL_MAT_NX, MUL_MAT_ID_NX)
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0}) {
+        for (bool use_id : {false, true}) {
+            for (int64_t m_batch : {1, 3}) {
+                test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 100, 224,
+                    use_id, 16, 8, false, false, true, false, {1, 1}));
+            }
         }
     }
 
