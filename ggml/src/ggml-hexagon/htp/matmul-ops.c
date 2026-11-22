@@ -2022,7 +2022,10 @@ static void fetch_dequant_tiled_worker_loop(const htp_thread_t * th, unsigned in
         return;
     }
 
-    const uint32_t blk = hmx_ceil_div(end - start, HTP_MM_FETCH_BLOCKS);
+    // Blocks are whole tile rows (all k tiles of 32 columns): dequant of some types reads other tiles of
+    // the same row (q2_K super-block header), which must be fetched by this thread and already popped.
+    const uint32_t row_tiles = dq->n_weight_tiles;
+    const uint32_t blk = hmx_ceil_div(hmx_ceil_div(end - start, row_tiles), HTP_MM_FETCH_BLOCKS) * row_tiles;
     uint8_t * raw = (uint8_t *) dq->src;
 
     uint32_t n_pushed = 0;
@@ -2063,7 +2066,8 @@ static void fetch_dequant_tiled_weight_chunk(struct htp_context * ctx, __fp16 * 
     st.dq.n_k_tiles         = n_k_tiles;
     st.dq.n_k_tiles_div     = n_k_tiles_div;
     st.dq.n_tot_tiles       = n_tot_tiles;
-    st.dq.n_tiles_per_task  = hmx_ceil_div(n_tot_tiles, n_hvx);
+    // Split on tile-row boundaries so no thread depends on tiles another thread fetches
+    st.dq.n_tiles_per_task  = hmx_ceil_div(n_tot_tiles / n_weight_tiles, n_hvx) * n_weight_tiles;
     st.dq.n_tasks           = hmx_ceil_div(n_tot_tiles, st.dq.n_tiles_per_task);
     st.dq.tile_size         = htp_tensor_get_tile_size(weight_type);
     st.dq.aligned_tile_size = htp_tensor_get_tile_padded_size(weight_type);
