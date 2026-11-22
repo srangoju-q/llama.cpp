@@ -430,6 +430,20 @@ static inline void htp_mm_hmx_vtcm_layout_build(
     L->total_bytes = off;
 }
 
+// VTCM stride of a weight tile on the HVX tiled paths. Packed types are DMAed as one contiguous
+// tile row and their vec-dots load the odd tiles (64 B off) unaligned. The prefetch slots stay padded.
+static inline uint32_t htp_mm_hvx_tile_stride(int type) {
+    switch (type) {
+        case HTP_TYPE_Q4_0:
+        case HTP_TYPE_IQ4_NL:
+        case HTP_TYPE_Q5_0:
+        case HTP_TYPE_Q8_0:
+            return htp_tensor_get_tile_size(type);
+        default:
+            return htp_tensor_get_tile_padded_size(type);
+    }
+}
+
 static inline void htp_mm_hvx_vtcm_layout_build(
     struct htp_mm_hvx_vtcm_layout * L,
     int kernel_type,
