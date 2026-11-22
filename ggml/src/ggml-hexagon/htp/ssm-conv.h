@@ -35,6 +35,12 @@ struct htp_ssm_conv_vtcm_layout {
     size_t dst_bytes;
 };
 
+// Prefill transposed block: {round_up(ncs, 32), 32} f32 (the shuffle transpose writes whole
+// 32-row blocks) followed by a 32-vector transpose scratch.
+static inline size_t htp_ssm_conv_src0_block_T_bytes(uint32_t ncs) {
+    return (size_t) hex_round_up(ncs, 32) * 32 * sizeof(float) + 32 * 128;
+}
+
 static inline void htp_ssm_conv_vtcm_layout_build(
     struct htp_ssm_conv_vtcm_layout * L,
     uint32_t d_inner_per_hvx,
@@ -56,7 +62,7 @@ static inline void htp_ssm_conv_vtcm_layout_build(
     } else {
         const uint32_t ncs              = d_conv - 1 + n_t;
         const size_t   raw_stride_bytes = ncs * sizeof(float) + sizeof(float);
-        const size_t   src0_block_T     = hex_round_up((size_t) ncs * 32 * sizeof(float), 128);
+        const size_t   src0_block_T     = htp_ssm_conv_src0_block_T_bytes(ncs);
         const size_t   src0_tile_raw    = hex_round_up((size_t) d_inner_tile * raw_stride_bytes, 128);
         L->src0_bytes_per_hvx           = 2 * src0_tile_raw + src0_block_T;
         L->dst_bytes_per_hvx            = 2 * hex_round_up((size_t) d_inner_tile * n_t * sizeof(float), 128);

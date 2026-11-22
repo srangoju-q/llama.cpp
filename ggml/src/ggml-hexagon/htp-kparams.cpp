@@ -2220,7 +2220,7 @@ static bool htp_kparams_solve_ssm_conv(
         const uint32_t vtcm_src1_per_hvx = src1_raw_bytes + src1_T_bytes;
 
         const size_t   vtcm_budget     = (vtcm_size > 0 ? vtcm_size / n_hvx : (1024 * 1024));
-        const uint32_t src0_block_T    = hex_round_up(ncs * 32 * sizeof(float), 128);
+        const size_t   src0_block_T    = htp_ssm_conv_src0_block_T_bytes(ncs);
         const size_t   fixed_bytes     = vtcm_src1_per_hvx + src0_block_T;
         const size_t   avail_for_tiles = vtcm_budget > fixed_bytes ? vtcm_budget - fixed_bytes : (128 * 1024);
 
