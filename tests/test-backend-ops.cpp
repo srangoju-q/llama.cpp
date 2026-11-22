@@ -11705,6 +11705,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
+    // single-row norm+scale (decode): backends that split one long row across threads must still fuse
+    for (int64_t n : { 1024, 4096 }) {
+        test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 1, 1, 1 }, 1e-6f, true, 0.5f));
+    }
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
             for (bool v : { false, true }) {

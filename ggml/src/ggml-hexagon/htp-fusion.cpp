@@ -187,7 +187,7 @@ static bool fuse_rms_norm_scale(const ggml_hexagon_session * sess, htp_opnode & 
     if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
 
     const ggml_tensor * src0 = prev.src0();
-    const ggml_tensor * dst  = cur.dst();
+    const ggml_tensor * dst  = cur.node; // cur.dst() can be a dims-collapsed view (e.g. 2816:1 -> 704:4 in decode)
     if (src0->type != GGML_TYPE_F32 || !htp_same_shape_and_contiguity(prev.dst(), dst)) return false;
     if (htp_inputs_overlap_unsafe(prev, dst)) return false;
 
