@@ -2001,6 +2001,81 @@ static void dequantize_tiled_worker_loop(const htp_thread_t * th, unsigned int n
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
 }
 
+#define HTP_MM_FETCH_BLOCKS 4
+
+typedef struct {
+    tiled_dequantize_state_t dq;       // dq.src = VTCM raw base of the chunk
+    dma_addr_t               src_ddr;  // DDR base of the chunk (tiled layout)
+} tiled_fetch_dequant_state_t;
+
+// Each worker DMAs its own tile range on its own queue and dequantizes it block by block.
+// Spreads the weight fetch over all HVX threads' DMA queues instead of one.
+static void fetch_dequant_tiled_worker_loop(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
+    const tiled_fetch_dequant_state_t * st = (const tiled_fetch_dequant_state_t *) data;
+    const tiled_dequantize_state_t    * dq = &st->dq;
+    struct htp_thread_trace * tr = th->trace;
+    (void) n;
+
+    const uint32_t start = i * dq->n_tiles_per_task;
+    const uint32_t end   = hex_smin(start + dq->n_tiles_per_task, dq->n_tot_tiles);
+    if (start >= end) {
+        return;
+    }
+
+    // Blocks are whole tile rows (all k tiles of 32 columns): dequant of some types reads other tiles of
+    // the same row (q2_K super-block header), which must be fetched by this thread and already popped.
+    const uint32_t row_tiles = dq->n_weight_tiles;
+    const uint32_t blk = hmx_ceil_div(hmx_ceil_div(end - start, row_tiles), HTP_MM_FETCH_BLOCKS) * row_tiles;
+    uint8_t * raw = (uint8_t *) dq->src;
+
+    uint32_t n_pushed = 0;
+    for (uint32_t t = start; t < end; t += blk) {
+        const uint32_t nt = hex_smin(blk, end - t);
+        dma_queue_push(th->dma_q, dma_make_data(raw + (size_t) t * dq->aligned_tile_size, st->src_ddr + (size_t) t * dq->tile_size),
+                       dq->aligned_tile_size, dq->tile_size, dq->tile_size, nt);
+        n_pushed++;
+    }
+    // One descriptor per block, so one pop per block (no descriptor splitting at these sizes)
+    assert(dma_queue_depth(th->dma_q) >= n_pushed);
+
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
+    for (uint32_t t = start; t < end; t += blk) {
+        dma_queue_pop(th->dma_q);
+        dq->task_fn(dq, t, hex_smin(t + blk, end));
+    }
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, i);
+}
+
+static void fetch_dequant_tiled_weight_chunk(struct htp_context * ctx, __fp16 * vtcm_dst, void * vtcm_raw,
+                                             dma_addr_t src_ddr, int n_cols, int k_block, size_t row_stride, int weight_type,
+                                             int n_k_tiles, struct fastdiv_values n_k_tiles_div,
+                                             tiled_dequant_task_fn_t dequant_worker_fn, int n_hvx) {
+    const uint32_t n_weight_tiles = k_block / htp_tensor_get_tile_k(weight_type);
+    const uint32_t n_tot_tiles    = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS) * n_weight_tiles;
+
+    tiled_fetch_dequant_state_t st;
+    memset(&st, 0, sizeof(st));
+    st.dq.dst               = vtcm_dst;
+    st.dq.src               = (const uint8_t *) vtcm_raw;
+    st.dq.task_fn           = dequant_worker_fn;
+    st.dq.n_cols            = n_cols;
+    st.dq.k_block           = k_block;
+    st.dq.row_stride        = row_stride;
+    st.dq.weight_type       = weight_type;
+    st.dq.n_weight_tiles    = n_weight_tiles;
+    st.dq.n_k_tiles         = n_k_tiles;
+    st.dq.n_k_tiles_div     = n_k_tiles_div;
+    st.dq.n_tot_tiles       = n_tot_tiles;
+    // Split on tile-row boundaries so no thread depends on tiles another thread fetches
+    st.dq.n_tiles_per_task  = hmx_ceil_div(n_tot_tiles / n_weight_tiles, n_hvx) * n_weight_tiles;
+    st.dq.n_tasks           = hmx_ceil_div(n_tot_tiles, st.dq.n_tiles_per_task);
+    st.dq.tile_size         = htp_tensor_get_tile_size(weight_type);
+    st.dq.aligned_tile_size = htp_tensor_get_tile_padded_size(weight_type);
+    st.src_ddr              = src_ddr;
+
+    work_queue_run(ctx->hvx_queue, fetch_dequant_tiled_worker_loop, &st, st.dq.n_tasks);
+}
+
 static void transfer_output_chunk_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void *data) {
     output_transfer_task_state_t *st = (output_transfer_task_state_t *) data;
 
@@ -3627,6 +3702,28 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
         transfer_activation_chunk_gathered_threaded(
             ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
             matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
+
+        if (is_tiled && dequant_worker_fn) {
+            // Tiled quantized weights: every HVX thread fetches and dequantizes its own slice
+            for (int i = 0; i < n_chunk_cnt; ++i) {
+                const size_t nc = (size_t) i * n_chunk_n_cols;
+                const size_t n_cols = hex_smin((size_t) n - nc, n_chunk_n_cols);
+                const size_t n_col_tiles = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS);
+
+                fetch_dequant_tiled_weight_chunk(ctx, (__fp16 *) vtcm_scratch0, vtcm_weight, weight + nc * weight_stride,
+                                                 (int) n_cols, k, row_stride, weight_type, n_k_tiles, n_k_tiles_div,
+                                                 dequant_worker_fn, n_hvx);
+
+                hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_scratch0, vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
+                hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
+                hmx_queue_pop(ctx->hmx_queue);
+
+                transfer_output_chunk_scattered_threaded(
+                    ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
+                    matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_hvx);
+            }
+            continue;
+        }
 
         // A0: Pre-fetch the first weight chunk (nc = 0)
         if (n > 0) {
