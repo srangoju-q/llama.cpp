@@ -2212,39 +2212,49 @@ static bool htp_kparams_solve_ssm_conv(
     const uint32_t raw_rpt         = (d_inner + n_hvx - 1) / n_hvx;
     const uint32_t d_inner_per_hvx = hex_round_up(raw_rpt, 32);
 
+    GGML_UNUSED(ncs);
+
     if (n_t == 1) {
         kparams->d_inner_tile = d_inner_per_hvx;
+        kparams->t_tile       = 1;
     } else {
-        const uint32_t src1_raw_bytes    = hex_round_up(d_inner_per_hvx * d_conv * sizeof(float), 128) + 128;
-        const uint32_t src1_T_bytes      = hex_round_up(d_conv * d_inner_per_hvx * sizeof(float), 128);
-        const uint32_t vtcm_src1_per_hvx = src1_raw_bytes + src1_T_bytes;
+        // A prefill chunk is {channel tile x token tile}. Its writeback is a 2D DMA with one row
+        // of d_inner_tile floats per token, so the channel tile sets the DMA row width. Keep it
+        // at up to 256 channels (1 KiB rows) and tile the tokens to fit VTCM, instead of shrinking
+        // the channel tile as the sequence grows (long prompts dropped to 32 channels, i.e.
+        // 128-byte DMA rows, and ran ~5x below the DMA rate of wide rows).
+        const uint32_t ch_tile_max = 256;
+        const uint32_t min_chunks  = 4;  // per thread, so the next fetch overlaps compute
 
-        const size_t   vtcm_budget     = (vtcm_size > 0 ? vtcm_size / n_hvx : (1024 * 1024));
-        const uint32_t src0_block_T    = hex_round_up(ncs * 32 * sizeof(float), 128);
-        const size_t   fixed_bytes     = vtcm_src1_per_hvx + src0_block_T;
-        const size_t   avail_for_tiles = vtcm_budget > fixed_bytes ? vtcm_budget - fixed_bytes : (128 * 1024);
+        uint32_t d_inner_tile = (std::min)(d_inner_per_hvx, ch_tile_max);
+        uint32_t t_tile       = 0;
 
-        uint32_t target_max_tile = hex_round_up((d_inner_per_hvx + 3) / 4, 32);
-        target_max_tile          = (std::max)(target_max_tile, 32u);
-        target_max_tile          = (std::min)(target_max_tile, 128u);
+        for (; d_inner_tile >= 32 && t_tile == 0; d_inner_tile -= 32) {
+            const uint32_t n_ctiles  = (d_inner_per_hvx + d_inner_tile - 1) / d_inner_tile;
+            const uint32_t n_tblocks = n_ctiles >= min_chunks ? 1 : (min_chunks + n_ctiles - 1) / n_ctiles;
+            const uint32_t t_cap     = (std::min)(n_t, (uint32_t) hex_round_up((n_t + n_tblocks - 1) / n_tblocks, 32));
 
-        const size_t raw_stride_bytes = ncs * sizeof(float) + sizeof(float);
-        uint32_t d_inner_tile = (uint32_t) (avail_for_tiles / (2 * (raw_stride_bytes + n_t * sizeof(float))));
-        d_inner_tile          = (d_inner_tile / 32) * 32;
-        if (d_inner_tile == 0) {
-            d_inner_tile = 32;
+            for (uint32_t tt = t_cap; tt > 0; tt = tt > 32 ? ((tt - 1) / 32) * 32 : 0) {
+                struct htp_ssm_conv_vtcm_layout Lt;
+                htp_ssm_conv_vtcm_layout_build(&Lt, d_inner_per_hvx, d_conv, n_t, d_inner_tile, tt, n_hvx);
+                if (Lt.total_bytes <= vtcm_size) {
+                    t_tile = tt;
+                    break;
+                }
+            }
+            if (t_tile > 0) {
+                break;
+            }
         }
-        if (d_inner_tile > target_max_tile) {
-            d_inner_tile = target_max_tile;
-        }
-        if (d_inner_tile > d_inner_per_hvx) {
-            d_inner_tile = d_inner_per_hvx;
+        if (t_tile == 0) {
+            return false;
         }
         kparams->d_inner_tile = d_inner_tile;
+        kparams->t_tile       = t_tile;
     }
 
     struct htp_ssm_conv_vtcm_layout L;
-    htp_ssm_conv_vtcm_layout_build(&L, d_inner_per_hvx, d_conv, n_t, kparams->d_inner_tile, n_hvx);
+    htp_ssm_conv_vtcm_layout_build(&L, d_inner_per_hvx, d_conv, n_t, kparams->d_inner_tile, kparams->t_tile, n_hvx);
 
     kparams->vtcm_size        = (uint32_t) L.total_bytes;
     kparams->div_d_inner_tile = init_fastdiv_values(kparams->d_inner_tile);
