@@ -373,14 +373,10 @@ static inline HVX_VectorPair unpack_and_interleave_4bit_x2(HVX_Vector v_src, HVX
     HVX_Vector v_lo = Q6_V_vand_VV(v_src, mask_h4);
     HVX_Vector v_hi = Q6_Vub_vlsr_VubR(v_src, 4);
     HVX_VectorPair v01_pair = Q6_W_vshuff_VVR(v_hi, v_lo, -1);
-    HVX_Vector v01_lo = Q6_V_lo_W(v01_pair);
-    HVX_Vector v01_hi = Q6_V_hi_W(v01_pair);
 
-    HVX_Vector v23_lo = Q6_V_valign_VVR(v01_hi, v01_lo, 64);
-    HVX_Vector v_W0 = Q6_V_lo_W(Q6_W_vshuff_VVR(v23_lo, v01_lo, -2));
-
-    HVX_Vector v67_lo = Q6_V_valign_VVR(v01_lo, v01_hi, 64);
-    HVX_Vector v_W1 = Q6_V_lo_W(Q6_W_vshuff_VVR(v67_lo, v01_hi, -2));
+    // interleave the halfwords of the two 64 B halves of each vector
+    HVX_Vector v_W0 = Q6_Vh_vshuff_Vh(Q6_V_lo_W(v01_pair));
+    HVX_Vector v_W1 = Q6_Vh_vshuff_Vh(Q6_V_hi_W(v01_pair));
 
     return Q6_W_vcombine_VV(v_W1, v_W0);
 }
@@ -543,8 +539,7 @@ static inline HVX_Vector accum_q8_0_32x1(
     HVX_Vector v_sum = Q6_V_vzero();
     #pragma unroll
     for (int g = 0; g < 8; g++) {
-        HVX_Vector v_rot = Q6_V_vror_VR(vptr[g], 64);
-        HVX_Vector v_W = Q6_V_lo_W(Q6_W_vshuff_VVR(v_rot, vptr[g], -2));
+        HVX_Vector v_W = Q6_Vh_vshuff_Vh(vptr[g]);
         v_sum = Q6_Vw_vrmpyacc_VwVbVb(v_sum, v_W, v_act[g]);
     }
     return v_sum;
@@ -559,8 +554,7 @@ static inline HVX_VectorPair accum_q8_0_32x2(
     HVX_Vector v_sum1 = Q6_V_vzero();
     #pragma unroll
     for (int g = 0; g < 8; g++) {
-        HVX_Vector v_rot = Q6_V_vror_VR(vptr[g], 64);
-        HVX_Vector v_W = Q6_V_lo_W(Q6_W_vshuff_VVR(v_rot, vptr[g], -2));
+        HVX_Vector v_W = Q6_Vh_vshuff_Vh(vptr[g]);
         v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W, v_act0[g]);
         v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W, v_act1[g]);
     }
@@ -578,14 +572,9 @@ static inline HVX_VectorPair unpack_and_interleave_5bit_x2(HVX_Vector v_src, HVX
     HVX_Vector v_lo = hvx_q5k_or_hibit(Q6_V_vand_VV(v_src, mask_h4), v_plane, 2 * i);
     HVX_Vector v_hi = hvx_q5k_or_hibit(Q6_Vub_vlsr_VubR(v_src, 4), v_plane, 2 * i + 1);
     HVX_VectorPair v01_pair = Q6_W_vshuff_VVR(v_hi, v_lo, -1);
-    HVX_Vector v01_lo = Q6_V_lo_W(v01_pair);
-    HVX_Vector v01_hi = Q6_V_hi_W(v01_pair);
 
-    HVX_Vector v23_lo = Q6_V_valign_VVR(v01_hi, v01_lo, 64);
-    HVX_Vector v_W0 = Q6_V_lo_W(Q6_W_vshuff_VVR(v23_lo, v01_lo, -2));
-
-    HVX_Vector v67_lo = Q6_V_valign_VVR(v01_lo, v01_hi, 64);
-    HVX_Vector v_W1 = Q6_V_lo_W(Q6_W_vshuff_VVR(v67_lo, v01_hi, -2));
+    HVX_Vector v_W0 = Q6_Vh_vshuff_Vh(Q6_V_lo_W(v01_pair));
+    HVX_Vector v_W1 = Q6_Vh_vshuff_Vh(Q6_V_hi_W(v01_pair));
 
     return Q6_W_vcombine_VV(v_W1, v_W0);
 }
@@ -650,14 +639,9 @@ static inline HVX_VectorPair unpack_and_interleave_q5_0_x2(HVX_Vector v_src, HVX
     HVX_Vector v_lo = hvx_q5_0_or_neg(Q6_V_vand_VV(v_src, mask_h4), v_plane, 2 * i);
     HVX_Vector v_hi = hvx_q5_0_or_neg(Q6_Vub_vlsr_VubR(v_src, 4), v_plane, 2 * i + 1);
     HVX_VectorPair v01_pair = Q6_W_vshuff_VVR(v_hi, v_lo, -1);
-    HVX_Vector v01_lo = Q6_V_lo_W(v01_pair);
-    HVX_Vector v01_hi = Q6_V_hi_W(v01_pair);
 
-    HVX_Vector v23_lo = Q6_V_valign_VVR(v01_hi, v01_lo, 64);
-    HVX_Vector v_W0 = Q6_V_lo_W(Q6_W_vshuff_VVR(v23_lo, v01_lo, -2));
-
-    HVX_Vector v67_lo = Q6_V_valign_VVR(v01_lo, v01_hi, 64);
-    HVX_Vector v_W1 = Q6_V_lo_W(Q6_W_vshuff_VVR(v67_lo, v01_hi, -2));
+    HVX_Vector v_W0 = Q6_Vh_vshuff_Vh(Q6_V_lo_W(v01_pair));
+    HVX_Vector v_W1 = Q6_Vh_vshuff_Vh(Q6_V_hi_W(v01_pair));
 
     return Q6_W_vcombine_VV(v_W1, v_W0);
 }
