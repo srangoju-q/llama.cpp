@@ -182,8 +182,9 @@ static std::string format_kernel_params(const htp_opnode & node) {
         snprintf(str, max_size, "seq 0x%x -> 0x%x", (uint32_t) node.node->op_params[0], (uint32_t) node.node->op_params[1]);
     } else if (node.opcode == HTP_OP_SSM_CONV) {
         const auto * kparams = node.kparams<htp_ssm_conv_kernel_params>();
-        snprintf(str, max_size, "%s nhvx %u vtcm %u", kparams->n_t == 1 ? "decode" : "prefill",
-                 (unsigned int) kparams->n_hvx, (unsigned int) kparams->vtcm_size);
+        snprintf(str, max_size, "%s nhvx %u vtcm %u tile %ux%u", kparams->n_t == 1 ? "decode" : "prefill",
+                 (unsigned int) kparams->n_hvx, (unsigned int) kparams->vtcm_size,
+                 (unsigned int) kparams->d_inner_tile, (unsigned int) kparams->t_tile);
     } else if (node.opcode == HTP_OP_SSM_SCAN) {
         const auto * kparams = node.kparams<htp_ssm_scan_kernel_params>();
         const char * ktype_str = kparams->kernel_type == HTP_SSM_SCAN_KERNEL_HMX        ? "hmx" :

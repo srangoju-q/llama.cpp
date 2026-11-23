@@ -2212,39 +2212,59 @@ static bool htp_kparams_solve_ssm_conv(
     const uint32_t raw_rpt         = (d_inner + n_hvx - 1) / n_hvx;
     const uint32_t d_inner_per_hvx = hex_round_up(raw_rpt, 32);
 
+    (void) ncs;
+
     if (n_t == 1) {
         kparams->d_inner_tile = d_inner_per_hvx;
+        kparams->t_tile       = 1;
     } else {
-        const uint32_t src1_raw_bytes    = hex_round_up(d_inner_per_hvx * d_conv * sizeof(float), 128) + 128;
-        const uint32_t src1_T_bytes      = hex_round_up(d_conv * d_inner_per_hvx * sizeof(float), 128);
-        const uint32_t vtcm_src1_per_hvx = src1_raw_bytes + src1_T_bytes;
+        // Prefill tiles are {d_inner_tile channels} x {t_tile tokens}. src0 is channel-major
+        // (one DMA row per channel, t_tile tokens wide) and dst is token-major (one DMA row per
+        // token, d_inner_tile channels wide), so a tile costs d_inner_tile + t_tile DMA rows.
+        // Each DMA row has a fixed cost, so pick the tile shape that fits VTCM with the fewest
+        // rows per element, (dt + t) / (dt * t), instead of keeping all n_t tokens resident
+        // (which shrinks the channel tile, and the dst rows, as n_t grows).
+        auto fits = [&](uint32_t dt, uint32_t tt) {
+            struct htp_ssm_conv_vtcm_layout Lt;
+            htp_ssm_conv_vtcm_layout_build(&Lt, d_inner_per_hvx, d_conv, n_t, dt, tt, n_hvx);
+            return Lt.total_bytes <= vtcm_size;
+        };
 
-        const size_t   vtcm_budget     = (vtcm_size > 0 ? vtcm_size / n_hvx : (1024 * 1024));
-        const uint32_t src0_block_T    = hex_round_up(ncs * 32 * sizeof(float), 128);
-        const size_t   fixed_bytes     = vtcm_src1_per_hvx + src0_block_T;
-        const size_t   avail_for_tiles = vtcm_budget > fixed_bytes ? vtcm_budget - fixed_bytes : (128 * 1024);
-
-        uint32_t target_max_tile = hex_round_up((d_inner_per_hvx + 3) / 4, 32);
-        target_max_tile          = (std::max)(target_max_tile, 32u);
-        target_max_tile          = (std::min)(target_max_tile, 128u);
-
-        const size_t raw_stride_bytes = ncs * sizeof(float) + sizeof(float);
-        uint32_t d_inner_tile = (uint32_t) (avail_for_tiles / (2 * (raw_stride_bytes + n_t * sizeof(float))));
-        d_inner_tile          = (d_inner_tile / 32) * 32;
-        if (d_inner_tile == 0) {
-            d_inner_tile = 32;
+        uint32_t best_dt = 0, best_tt = 0;
+        double   best_cost = 0.0;
+        for (uint32_t dt = 32; dt <= d_inner_per_hvx; dt += 32) {
+            if (!fits(dt, 1)) {
+                break;
+            }
+            uint32_t tt = n_t;
+            if (!fits(dt, tt)) {
+                uint32_t lo = 1, hi = n_t;  // fits(lo), !fits(hi)
+                while (hi - lo > 1) {
+                    const uint32_t mid = lo + (hi - lo) / 2;
+                    if (fits(dt, mid)) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                tt = lo;
+            }
+            const double cost = (double) (dt + tt) / ((double) dt * (double) tt);
+            if (best_dt == 0 || cost < best_cost) {
+                best_dt   = dt;
+                best_tt   = tt;
+                best_cost = cost;
+            }
         }
-        if (d_inner_tile > target_max_tile) {
-            d_inner_tile = target_max_tile;
+        if (best_dt == 0) {
+            return false;
         }
-        if (d_inner_tile > d_inner_per_hvx) {
-            d_inner_tile = d_inner_per_hvx;
-        }
-        kparams->d_inner_tile = d_inner_tile;
+        kparams->d_inner_tile = best_dt;
+        kparams->t_tile       = best_tt;
     }
 
     struct htp_ssm_conv_vtcm_layout L;
-    htp_ssm_conv_vtcm_layout_build(&L, d_inner_per_hvx, d_conv, n_t, kparams->d_inner_tile, n_hvx);
+    htp_ssm_conv_vtcm_layout_build(&L, d_inner_per_hvx, d_conv, n_t, kparams->d_inner_tile, kparams->t_tile, n_hvx);
 
     kparams->vtcm_size        = (uint32_t) L.total_bytes;
     kparams->div_d_inner_tile = init_fastdiv_values(kparams->d_inner_tile);

@@ -11867,6 +11867,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ubatch-sized prefill (n_t ~1k): backends that tile over tokens split the sequence into
+    // several token tiles; odd d_inner leaves a partial channel block
+    for (int64_t d_conv : {3, 4}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 1000, 3000, 1, 1}, {d_conv, 3000, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 1024, 4096, 2, 1}, {d_conv, 4096, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {d_conv - 1 + 1024, 4096, 1, 1}, {d_conv, 4096, 1, 1}, false));
+    }
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {
