@@ -169,19 +169,39 @@ static inline void hvx_ssm_conv_decode_4(const float * x, const float * w, float
 }
 
 // Transpose src0 for prefill: one 32-channel block {32, ncs} (VTCM) -> T {ncs, 32} (VTCM).
-// One VTCM gather per output row: lane r picks channel cb+r, the region bound drops
-// the lanes past the channel tail.
+// Works in 32x32 sub-blocks: 32 unaligned row loads (one per channel, 32 tokens each),
+// an in-register vshuff butterfly transpose, then one aligned store per token.
+// This replaces one VTCM vgather per token: the scatter/gather unit is shared by all
+// HVX contexts, so per-token gathers serialised the threads; loads + shuffles run on
+// every context in parallel.
+// The loads of the last sub-block may read past the end of a channel row (into the next
+// row / the rest of the VTCM scratch); those lanes become tokens >= ncs and are not stored.
+// Channels past the tail (r >= cb_n) are zero.
 static inline void hvx_ssm_conv_transpose_block(const float * raw_block,
                                                 float *       T,
                                                 uint32_t      raw_stride_bytes,
                                                 uint32_t      ncs,
-                                                uint32_t      cb_n,
-                                                HVX_Vector    vv) {
-    const size_t   base = (size_t) raw_block;
-    const uint32_t mu   = cb_n * raw_stride_bytes - 1;
+                                                uint32_t      cb_n) {
+    const uint8_t * base = (const uint8_t *) raw_block;
+    HVX_Vector      m[32];
 
-    for (uint32_t t = 0; t < ncs; ++t) {
-        Q6_vgather_ARMVw((HVX_Vector *) (T + (size_t) t * VLEN_FP32), base + t * sizeof(float), mu, vv);
+    for (uint32_t t0 = 0; t0 < ncs; t0 += VLEN_FP32) {
+        const uint32_t n = MIN(VLEN_FP32, ncs - t0);
+
+        const uint8_t * src = base + (size_t) t0 * sizeof(float);
+        for (uint32_t r = 0; r < cb_n; ++r) {
+            m[r] = *(const HVX_UVector *) (src + (size_t) r * raw_stride_bytes);
+        }
+        for (uint32_t r = cb_n; r < VLEN_FP32; ++r) {
+            m[r] = Q6_V_vzero();
+        }
+
+        hvx_transpose_32x32_f32(m);
+
+        float * dst = T + (size_t) t0 * VLEN_FP32;
+        for (uint32_t k = 0; k < n; ++k) {
+            *(HVX_Vector *) (dst + (size_t) k * VLEN_FP32) = m[k];
+        }
     }
 }
 
@@ -447,9 +467,6 @@ static void ssm_conv_thread_f32_prefill(const htp_thread_t * th, unsigned int nt
 
     const uint32_t C_TILE = VLEN_FP32;
 
-    // gather offsets: lane r reads channel r of the raw tile block
-    const HVX_Vector vv = hvx_vec_gather_offsets_w(raw_stride_bytes);
-
     uint32_t i3       = 0;
     uint32_t tile_off = 0;
 
@@ -473,7 +490,7 @@ static void ssm_conv_thread_f32_prefill(const htp_thread_t * th, unsigned int nt
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
             const float * raw_ch = (const float *) ((const uint8_t *) raw + (size_t) cb * raw_stride_bytes);
-            hvx_ssm_conv_transpose_block(raw_ch, src0_T, raw_stride_bytes, ncs, cb_n, vv);
+            hvx_ssm_conv_transpose_block(raw_ch, src0_T, raw_stride_bytes, ncs, cb_n);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) tile_off);
 
             const float * restrict wp = src1_T + tile_off + cb;
