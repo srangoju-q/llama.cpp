@@ -1031,10 +1031,7 @@ struct htp_gdn_hmx_gemm_task {
     uint8_t *      hmx_scales;
 };
 
-static void htp_gdn_hmx_gemm_worker(const htp_thread_t * th, void * data) {
-    struct htp_gdn_hmx_gemm_task * task = (struct htp_gdn_hmx_gemm_task *) data;
-    asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int)task->hmx_scales));
-
+static inline void htp_gdn_hmx_gemm_run(const struct htp_gdn_hmx_gemm_task * task) {
     const size_t dot_stride = task->dot_stride;
     for (uint32_t r = 0; r < task->n_row_tiles; ++r) {
         const __fp16 * r_tiles = task->row_tiles + r * dot_stride;
@@ -1049,8 +1046,44 @@ static void htp_gdn_hmx_gemm_worker(const htp_thread_t * th, void * data) {
     }
 }
 
-static inline void htp_gdn_push_hmx_gemm_task(
+// One GEMM stage for every head of the batch: a single HMX queue descriptor runs the
+// per-head GEMMs back to back (same order as one descriptor per head). This cuts the
+// producer-side push + futex wake + pop round trips from n_heads to 1 per stage.
+#define HTP_GDN_MAX_BATCH 8
+
+struct htp_gdn_hmx_stage {
+    uint32_t                               n;
+    const struct htp_gdn_hmx_gemm_task *   t[HTP_GDN_MAX_BATCH];
+};
+
+static void htp_gdn_hmx_stage_worker(const htp_thread_t * th, void * data) {
+    const struct htp_gdn_hmx_stage * st = (const struct htp_gdn_hmx_stage *) data;
+    const uint8_t * bias = NULL;
+    for (uint32_t h = 0; h < st->n; ++h) {
+        const struct htp_gdn_hmx_gemm_task * task = st->t[h];
+        if (task->hmx_scales != bias) {
+            bias = task->hmx_scales;
+            asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) bias));
+        }
+        htp_gdn_hmx_gemm_run(task);
+    }
+}
+
+static inline void htp_gdn_push_hmx_stage(
     hmx_queue_t q,
+    struct htp_gdn_hmx_stage * st,
+    struct htp_gdn_hmx_gemm_task (*tasks)[9],
+    uint32_t s,
+    uint32_t n
+) {
+    st->n = n;
+    for (uint32_t h = 0; h < n; ++h) {
+        st->t[h] = &tasks[h][s];
+    }
+    hmx_queue_push(q, hmx_queue_make_desc(htp_gdn_hmx_stage_worker, st));
+}
+
+static inline void htp_gdn_set_hmx_gemm_task(
     struct htp_gdn_hmx_gemm_task * task,
     const __fp16 * row_tiles,
     const __fp16 * col_tiles,
@@ -1068,8 +1101,6 @@ static inline void htp_gdn_push_hmx_gemm_task(
     task->n_dot_tiles = n_dot_tiles;
     task->dot_stride  = n_dot_tiles * HMX_FP16_TILE_N_ELMS;
     task->hmx_scales  = scales;
-
-    hmx_queue_push(q, hmx_queue_make_desc(htp_gdn_hmx_gemm_worker, task));
 }
 
 static inline void gdn_unpack_64x64_tiles_to_vectors(
@@ -2065,7 +2096,8 @@ static int gated_delta_net_f32_hmx_chunked(
     work_queue_t wp    = octx->ctx->hvx_queue;
 
     struct htp_gdn_head_ptrs heads[8];
-    struct htp_gdn_hmx_gemm_task gemm_tasks[8][9];
+    struct htp_gdn_hmx_gemm_task gemm_tasks[HTP_GDN_MAX_BATCH][9];
+    struct htp_gdn_hmx_stage     stages[9];
 
     uint32_t n_batch = 1;
     for (uint32_t r = row_start; r < row_start + nrows; r += n_batch) {
@@ -2150,86 +2182,74 @@ static int gated_delta_net_f32_hmx_chunked(
 
             work_queue_run(wp, gdn_hvx_phase1a_worker, &bctx, n_batch);
 
+            // HMX stages are pushed once per stage for all heads (see htp_gdn_hmx_stage);
+            // stage order and the points where they are waited on are unchanged.
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][0], heads[h].k_row_tiles, heads[h].k_col_tiles, heads[h].kk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][0], heads[h].k_row_tiles, heads[h].k_col_tiles, heads[h].kk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][2], heads[h].k_prime_row_tiles, heads[h].s_col_tiles, heads[h].v_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
             }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][2], heads[h].k_prime_row_tiles, heads[h].s_col_tiles, heads[h].v_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
-            }
+            htp_gdn_push_hmx_stage(hmx_q, &stages[0], gemm_tasks, 0, n_batch);
+            htp_gdn_push_hmx_stage(hmx_q, &stages[2], gemm_tasks, 2, n_batch);
 
             work_queue_run(wp, gdn_hvx_phase1b_worker, &bctx, n_batch);
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 0
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][1], heads[h].q_row_tiles, heads[h].k_col_tiles, heads[h].qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][1], heads[h].q_row_tiles, heads[h].k_col_tiles, heads[h].qk_tiles, 2, 2, n_sv_tiles, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][3], heads[h].q_prime_row_tiles, heads[h].s_col_tiles, heads[h].o_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
             }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][3], heads[h].q_prime_row_tiles, heads[h].s_col_tiles, heads[h].o_inter_tiles, 2, n_sv_tiles, n_sv_tiles, vtcm_scales_1);
-            }
+            htp_gdn_push_hmx_stage(hmx_q, &stages[1], gemm_tasks, 1, n_batch);
+            htp_gdn_push_hmx_stage(hmx_q, &stages[3], gemm_tasks, 3, n_batch);
 
             work_queue_run(wp, gdn_hvx_phase2_worker, &bctx, n_batch);
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 2
+            hmx_queue_pop(hmx_q);  // stage 1
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(
-                    hmx_q, &gemm_tasks[h][7],
+                htp_gdn_set_hmx_gemm_task(
+                    &gemm_tasks[h][7],
                     (__fp16 *) heads[h].vtcm_m,
                     heads[h].inv_row_tiles + 0 * HMX_FP16_TILE_N_ELMS,
                     (__fp16 *) heads[h].vtcm_tmp,
                     1, 1, 1, vtcm_scales_1
                 );
-            }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(
-                    hmx_q, &gemm_tasks[h][8],
+                htp_gdn_set_hmx_gemm_task(
+                    &gemm_tasks[h][8],
                     (__fp16 *) heads[h].vtcm_m + HMX_FP16_TILE_N_ELMS,
                     (__fp16 *) heads[h].vtcm_tmp,
                     heads[h].inv_row_tiles + 2 * HMX_FP16_TILE_N_ELMS,
                     1, 1, 1, vtcm_scales_1
                 );
             }
+            // stage 8 reads stage 7's vtcm_tmp: keep them as two stages, 7 first
+            htp_gdn_push_hmx_stage(hmx_q, &stages[7], gemm_tasks, 7, n_batch);
+            htp_gdn_push_hmx_stage(hmx_q, &stages[8], gemm_tasks, 8, n_batch);
 
             work_queue_run(wp, gdn_hvx_phase3_worker, &bctx, n_batch);
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 3
+            hmx_queue_pop(hmx_q);  // stage 7
+            hmx_queue_pop(hmx_q);  // stage 8
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][4], heads[h].inv_row_tiles, heads[h].v_prime_col_tiles, heads[h].delta_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][4], heads[h].inv_row_tiles, heads[h].v_prime_col_tiles, heads[h].delta_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
             }
+            htp_gdn_push_hmx_stage(hmx_q, &stages[4], gemm_tasks, 4, n_batch);
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 4
 
             work_queue_run(wp, gdn_hvx_phase4_worker, &bctx, n_batch);
 
             for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][5], heads[h].a_row_tiles, heads[h].delta_col_tiles, heads[h].o_intra_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][5], heads[h].a_row_tiles, heads[h].delta_col_tiles, heads[h].o_intra_tiles, 2, n_sv_tiles, 2, vtcm_scales_1);
+                htp_gdn_set_hmx_gemm_task(&gemm_tasks[h][6], heads[h].d_row_tiles, heads[h].k_col_tiles_64x128, heads[h].s_update_tiles, n_sv_tiles, n_sv_tiles, 2, vtcm_scales_1);
             }
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                htp_gdn_push_hmx_gemm_task(hmx_q, &gemm_tasks[h][6], heads[h].d_row_tiles, heads[h].k_col_tiles_64x128, heads[h].s_update_tiles, n_sv_tiles, n_sv_tiles, 2, vtcm_scales_1);
-            }
+            htp_gdn_push_hmx_stage(hmx_q, &stages[5], gemm_tasks, 5, n_batch);
+            htp_gdn_push_hmx_stage(hmx_q, &stages[6], gemm_tasks, 6, n_batch);
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 5
 
             work_queue_run(wp, gdn_hvx_phase5_worker, &bctx, n_batch);
 
@@ -2241,9 +2261,7 @@ static int gated_delta_net_f32_hmx_chunked(
                                dst->nb[1], S_v * sizeof(float), S_v * sizeof(float), valid_tokens);
             }
 
-            for (uint32_t h = 0; h < n_batch; ++h) {
-                hmx_queue_pop(hmx_q);
-            }
+            hmx_queue_pop(hmx_q);  // stage 6
 
             work_queue_run(wp, gdn_hvx_phase6_worker, &bctx, n_batch);
         }
